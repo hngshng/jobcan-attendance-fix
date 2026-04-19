@@ -1,0 +1,9 @@
+node_modules/
+.env
+dist/
+exploration/
+*.log
+.DS_Store
+# We use pnpm; drop any stray npm lockfile.
+package-lock.json
+.idea
