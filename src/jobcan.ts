@@ -47,6 +47,15 @@ export type Correction = {
 
 export type ExistingStamp = { kind: string; time: string };
 
+export type LeaveApplication = {
+  year: number;
+  month: number;
+  day: number;
+  status: string;      // "承認", "承認待ち", "却下"
+  content: string;     // e.g. "病気休暇/Sick Leave (全休/Full Day)", "在宅勤務/Remote Work"
+  isRemoteWork: boolean;
+};
+
 export async function login(context: BrowserContext, email: string, password: string): Promise<Page> {
   const page = await context.newPage();
   await page.goto(SIGN_IN_URL, { waitUntil: "domcontentloaded" });
@@ -181,6 +190,60 @@ export async function getExistingStamps(
     }),
   );
   return rows.filter((r) => r.kind !== "" && r.time !== "");
+}
+
+/**
+ * Fetch 休暇申請 (leave applications) between two dates (inclusive).
+ * Used to detect pending (承認待ち) non-RW applications so we don't
+ * accidentally submit 打刻 for days the user is on leave.
+ */
+export async function fetchLeaveApplications(
+  page: Page,
+  from: { year: number; month: number; day: number },
+  to: { year: number; month: number; day: number },
+): Promise<LeaveApplication[]> {
+  const params = new URLSearchParams({
+    search_type: "term",
+    "from[y]": String(from.year),
+    "from[m]": String(from.month),
+    "from[d]": String(from.day),
+    "to[y]": String(to.year),
+    "to[m]": String(to.month),
+    "to[d]": String(to.day),
+  });
+  const url = `https://ssl.jobcan.jp/employee/holiday?${params.toString()}`;
+  await page.goto(url, { waitUntil: "domcontentloaded" });
+
+  // The data table has a column header "申請No". If zero applications exist in
+  // the range, Jobcan omits the table entirely — treat that as an empty list.
+  const tableCount = await page.locator('table:has(th:has-text("申請No"))').count();
+  if (tableCount === 0) return [];
+
+  const rows = await page.$$eval(
+    'table:has(th:has-text("申請No")) tbody tr',
+    (trs) =>
+      trs.map((tr) => {
+        const tds = tr.querySelectorAll("td");
+        const date = ((tds[1] && tds[1].textContent) || "").trim();
+        const status = ((tds[2] && tds[2].textContent) || "").trim();
+        const content = ((tds[3] && tds[3].textContent) || "").trim();
+        return { date, status, content };
+      }),
+  );
+
+  return rows
+    .filter((r) => /^\d{4}\/\d{2}\/\d{2}/.test(r.date))
+    .map((r) => {
+      const m = r.date.match(/^(\d{4})\/(\d{2})\/(\d{2})/)!;
+      return {
+        year: Number(m[1]),
+        month: Number(m[2]),
+        day: Number(m[3]),
+        status: r.status,
+        content: r.content,
+        isRemoteWork: /在宅勤務|Remote\s*Work/i.test(r.content),
+      };
+    });
 }
 
 /** Submit one 打刻 (either 出勤 or 退勤). */

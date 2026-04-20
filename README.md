@@ -13,6 +13,11 @@ default clock-in/out times, asks for your approval, and submits them via the
   - 勤怠状況 indicates RW (`在宅勤務/Remote Work`) **and** at least one of
     出勤時刻 / 退勤時刻 is blank. Only the blank side(s) are submitted.
 - Skips weekends and national holidays (they never show 欠 or RW-with-blanks).
+- Skips dates with a pending (`承認待ち`) non-RW entry on 休暇申請一覧.
+  Pending leave applications don't yet show on 出勤簿's 勤怠状況 column, so
+  without this check the tool would try to fill 打刻 for a day the user is
+  actually on leave. Pending **RW** applications are kept in the plan —
+  in-office and remote days both still need 出勤/退勤 打刻.
 - Dedupes per-submission against 打刻一覧 on the 打刻修正 page: any
   (kind, time) already stamped — approved or pending-approval — is removed
   from the plan. A date is fully skipped only when nothing's left to submit.
@@ -123,6 +128,19 @@ This also handles the RW-partial case correctly: an RW day with an existing
 09:00 出勤 and a missing 退勤 has `{出勤, 09:00}` on 打刻一覧, so the planner
 submits only `{退勤, 18:00}` — the approved side isn't re-punched.
 
+## How pending leave applications are handled
+
+After the initial 欠/RW scan, the tool fetches 休暇申請一覧
+(`https://ssl.jobcan.jp/employee/holiday`) for the full scan range and
+filters out any candidate dates that have a **pending (`承認待ち`) non-RW**
+application. These are applications your manager hasn't approved yet, so
+出勤簿's 勤怠状況 column still shows 欠 for them — without this filter the
+tool would try to stamp a day you're actually off.
+
+RW applications (`在宅勤務/Remote Work`) are intentionally **not** filtered
+out: whether pending or approved, RW days still need 出勤 / 退勤 打刻 on
+打刻修正, so the normal planning + dedup flow applies to them.
+
 ## Project layout
 
 ```
@@ -138,7 +156,8 @@ submits only `{退勤, 18:00}` — the approved side isn't re-punched.
 │   ├── jobcan.ts          # login, scraping, planner, form submission
 │   ├── explore.ts         # read-only page dumper (whole flow)
 │   ├── probe-logs.ts      # dump 打刻一覧 for a single date
-│   └── probe-row.ts       # print parsed attendance rows for a month
+│   ├── probe-row.ts       # print parsed attendance rows for a month
+│   └── probe-holidays.ts  # dump 休暇申請一覧 for structure inspection
 └── exploration/           # artifacts from probes/explore (git-ignored)
 ```
 
@@ -154,7 +173,8 @@ submits only `{退勤, 18:00}` — the approved side isn't re-punched.
   `src/jobcan.ts`).
 - **Selectors broken after a Jobcan update** — re-run `pnpm explore` and
   inspect the dumps in `./exploration/` to find the new markup, then update
-  `fetchMonthRows` / `hasPendingStamps` / the modify-form selectors.
+  `fetchMonthRows` / `getExistingStamps` / `fetchLeaveApplications` / the
+  modify-form selectors.
 
 ## Safety notes
 

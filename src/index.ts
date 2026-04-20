@@ -12,6 +12,7 @@ import {
   type AttendanceRow,
   type Correction,
   applyCorrection,
+  fetchLeaveApplications,
   fetchMonthRows,
   getExistingStamps,
   login,
@@ -123,6 +124,59 @@ async function main() {
       }
     } else {
       console.log("→ Previous month has missing entries — skipping current month until fixed.");
+    }
+
+    // Drop dates with a pending (承認待ち) non-RW leave application on
+    // 休暇申請一覧. Pending applications don't yet show on the 出勤簿 status
+    // column — without this filter we'd try to fill 打刻 for a day the user
+    // is actually on leave. RW applications are explicitly allowed through:
+    // RW still requires 出勤/退勤 times.
+    if (corrections.length > 0) {
+      const from = { year: prev.year, month: prev.month, day: 1 };
+      const to = {
+        year: today.getFullYear(),
+        month: today.getMonth() + 1,
+        day: today.getDate(),
+      };
+      console.log(
+        `→ Checking 休暇申請一覧 for pending non-RW applications (${from.year}-${String(from.month).padStart(2, "0")}-${String(from.day).padStart(2, "0")} .. ${to.year}-${String(to.month).padStart(2, "0")}-${String(to.day).padStart(2, "0")})`,
+      );
+      const leaves = await fetchLeaveApplications(page, from, to);
+      const pendingNonRw = leaves.filter(
+        (l) => l.status === "承認待ち" && !l.isRemoteWork,
+      );
+      console.log(
+        `   ${leaves.length} application(s) in range; ${pendingNonRw.length} pending non-RW`,
+      );
+      const blockingKeys = new Set(
+        pendingNonRw.map((l) => `${l.year}-${l.month}-${l.day}`),
+      );
+      const leaveSkipped: Correction[] = [];
+      corrections = corrections.filter((c) => {
+        const key = `${c.row.year}-${c.row.month}-${c.row.day}`;
+        if (blockingKeys.has(key)) {
+          leaveSkipped.push(c);
+          return false;
+        }
+        return true;
+      });
+      if (leaveSkipped.length > 0) {
+        console.log(
+          `→ Skipping ${leaveSkipped.length} date(s) with pending non-RW leave applications:`,
+        );
+        for (const c of leaveSkipped) {
+          const d = `${c.row.year}-${String(c.row.month).padStart(2, "0")}-${String(c.row.day).padStart(2, "0")}`;
+          const leave = leaves.find(
+            (l) =>
+              l.year === c.row.year &&
+              l.month === c.row.month &&
+              l.day === c.row.day &&
+              l.status === "承認待ち" &&
+              !l.isRemoteWork,
+          );
+          console.log(`   - ${d} (${leave ? leave.content : "pending leave"})`);
+        }
+      }
     }
 
     // Narrow to --only target if specified (before the pending-stamp check,
