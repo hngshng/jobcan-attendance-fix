@@ -11,11 +11,15 @@ import readline from "node:readline/promises";
 import {
   type AttendanceRow,
   type Correction,
+  type LeaveApplication,
   applyCorrection,
   fetchLeaveApplications,
   fetchMonthRows,
   getExistingStamps,
+  isAbsenceStatus,
+  isPendingApproval,
   login,
+  normalizeStampKind,
   planCorrections,
 } from "./jobcan.js";
 
@@ -34,7 +38,7 @@ function prevMonth(today: Date) {
 }
 
 function monthIsFullyInput(rows: AttendanceRow[]): boolean {
-  return rows.every((r) => !r.statusText.includes("欠"));
+  return rows.every((r) => !isAbsenceStatus(r.statusText));
 }
 
 function reasonLabel(reason: Correction["reason"]): string {
@@ -44,6 +48,41 @@ function reasonLabel(reason: Correction["reason"]): string {
     case "pm-off": return "PM off";
     case "rw-partial": return "RW partial";
   }
+}
+
+function ymd(year: number, month: number, day: number): string {
+  return `${String(year).padStart(4, "0")}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+}
+
+/**
+ * Report every day covered by a 休暇申請 (leave/vacation request) in the scan
+ * window with its approval status, and whether the tool records 打刻 time for it:
+ *   - 在宅勤務/Remote Work (RW): still a working day → time IS recorded.
+ *   - any other vacation (Sick, PTO, …): a day off → time is NOT recorded.
+ * A multi-day request contributes one row per day, tagged with its span.
+ */
+function printLeaveTable(leaves: LeaveApplication[]) {
+  console.log("\nLeave / vacation days:\n");
+  if (leaves.length === 0) {
+    console.log("  (none in range)\n");
+    return;
+  }
+  const header =
+    "  Date        | Approval status      | Time recorded     | Type";
+  const bar = "  " + "-".repeat(header.length - 2);
+  console.log(header);
+  console.log(bar);
+  const sorted = [...leaves].sort(
+    (a, b) => a.year - b.year || a.month - b.month || a.day - b.day,
+  );
+  for (const l of sorted) {
+    const timeRecorded = l.isRemoteWork ? "yes (working day)" : "no (day off)";
+    const tag = l.spanLabel ? `  [#${l.appliedId} ${l.spanLabel}]` : "";
+    console.log(
+      `  ${ymd(l.year, l.month, l.day)}  | ${l.status.padEnd(20)} | ${timeRecorded.padEnd(17)} | ${l.content}${tag}`,
+    );
+  }
+  console.log();
 }
 
 function printCorrectionTable(corrections: Correction[]) {
@@ -126,28 +165,33 @@ async function main() {
       console.log("→ Previous month has missing entries — skipping current month until fixed.");
     }
 
-    // Drop dates with a pending (承認待ち) non-RW leave application on
-    // 休暇申請一覧. Pending applications don't yet show on the 出勤簿 status
-    // column — without this filter we'd try to fill 打刻 for a day the user
-    // is actually on leave. RW applications are explicitly allowed through:
-    // RW still requires 出勤/退勤 times.
-    if (corrections.length > 0) {
-      const from = { year: prev.year, month: prev.month, day: 1 };
-      const to = {
-        year: today.getFullYear(),
-        month: today.getMonth() + 1,
-        day: today.getDate(),
-      };
-      console.log(
-        `→ Checking 休暇申請一覧 for pending non-RW applications (${from.year}-${String(from.month).padStart(2, "0")}-${String(from.day).padStart(2, "0")} .. ${to.year}-${String(to.month).padStart(2, "0")}-${String(to.day).padStart(2, "0")})`,
-      );
-      const leaves = await fetchLeaveApplications(page, from, to);
-      const pendingNonRw = leaves.filter(
-        (l) => l.status === "承認待ち" && !l.isRemoteWork,
-      );
-      console.log(
-        `   ${leaves.length} application(s) in range; ${pendingNonRw.length} pending non-RW`,
-      );
+    // Fetch every 休暇申請 (leave/vacation request) in the scan window. Used
+    // both for the report (printed below) and to drop dates blocked by a
+    // pending non-RW application.
+    //
+    // Pending applications don't yet show on the 出勤簿 status column — without
+    // this filter we'd try to fill 打刻 for a day the user is actually on leave.
+    // 在宅勤務/Remote Work is intentionally NOT blocked: RW is a working day and
+    // still needs 出勤/退勤 times.
+    const from = { year: prev.year, month: prev.month, day: 1 };
+    const to = {
+      year: today.getFullYear(),
+      month: today.getMonth() + 1,
+      day: today.getDate(),
+    };
+    console.log(
+      `→ Fetching 休暇申請一覧 (${ymd(from.year, from.month, from.day)} .. ${ymd(to.year, to.month, to.day)})`,
+    );
+    const leaves = await fetchLeaveApplications(page, from, to);
+    const pendingNonRw = leaves.filter(
+      (l) => isPendingApproval(l.status) && !l.isRemoteWork,
+    );
+    const requestCount = new Set(leaves.map((l) => l.appliedId)).size;
+    console.log(
+      `   ${leaves.length} leave day(s) across ${requestCount} request(s) in range; ${pendingNonRw.length} pending non-RW day(s) (blocks 打刻)`,
+    );
+
+    if (corrections.length > 0 && pendingNonRw.length > 0) {
       const blockingKeys = new Set(
         pendingNonRw.map((l) => `${l.year}-${l.month}-${l.day}`),
       );
@@ -165,16 +209,17 @@ async function main() {
           `→ Skipping ${leaveSkipped.length} date(s) with pending non-RW leave applications:`,
         );
         for (const c of leaveSkipped) {
-          const d = `${c.row.year}-${String(c.row.month).padStart(2, "0")}-${String(c.row.day).padStart(2, "0")}`;
           const leave = leaves.find(
             (l) =>
               l.year === c.row.year &&
               l.month === c.row.month &&
               l.day === c.row.day &&
-              l.status === "承認待ち" &&
+              isPendingApproval(l.status) &&
               !l.isRemoteWork,
           );
-          console.log(`   - ${d} (${leave ? leave.content : "pending leave"})`);
+          console.log(
+            `   - ${ymd(c.row.year, c.row.month, c.row.day)} (${leave ? leave.content : "pending leave"})`,
+          );
         }
       }
     }
@@ -210,12 +255,12 @@ async function main() {
       const partiallyDeduped: { c: Correction; removed: { kind: string; time: string }[] }[] = [];
       for (const c of corrections) {
         const existing = await getExistingStamps(page, c.row.year, c.row.month, c.row.day);
-        const remaining = c.submissions.filter(
-          (s) => !existing.some((e) => e.kind === s.kind && e.time === s.time),
-        );
-        const removed = c.submissions.filter(
-          (s) => existing.some((e) => e.kind === s.kind && e.time === s.time),
-        );
+        const alreadyStamped = (s: { kind: string; time: string }) =>
+          existing.some(
+            (e) => normalizeStampKind(e.kind) === normalizeStampKind(s.kind) && e.time === s.time,
+          );
+        const remaining = c.submissions.filter((s) => !alreadyStamped(s));
+        const removed = c.submissions.filter((s) => alreadyStamped(s));
         if (remaining.length === 0) {
           fullySkipped.push(c);
         } else {
@@ -246,6 +291,7 @@ async function main() {
       corrections = kept;
     }
 
+    printLeaveTable(leaves);
     printCorrectionTable(corrections);
 
     if (corrections.length === 0) {

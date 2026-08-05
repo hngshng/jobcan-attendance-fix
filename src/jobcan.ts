@@ -47,6 +47,11 @@ export type Correction = {
 
 export type ExistingStamp = { kind: string; time: string };
 
+/**
+ * One calendar day covered by a 休暇申請. A request spanning several days is
+ * expanded into one LeaveApplication per day, so callers can match a date
+ * without knowing anything about ranges.
+ */
 export type LeaveApplication = {
   year: number;
   month: number;
@@ -54,7 +59,100 @@ export type LeaveApplication = {
   status: string;      // "承認", "承認待ち", "却下"
   content: string;     // e.g. "病気休暇/Sick Leave (全休/Full Day)", "在宅勤務/Remote Work"
   isRemoteWork: boolean;
+  appliedId: string;   // 申請No — the applied_id of the request this day came from
+  spanLabel?: string;  // "2026-07-27..2026-07-29", set only for multi-day requests
 };
+
+// --- Locale-tolerant matchers ---------------------------------------------
+// The Jobcan UI renders in either Japanese or English depending on the
+// account's language setting. Column headers, status badges, and the leave
+// date format all change with it, so every text-based match below accepts
+// both languages. IDs (#ter_time, #insert_button, #logs-table) are stable and
+// used directly.
+
+// Attendance data table: header is 勤怠状況 (JP) / "Attendance Status" (EN).
+const ATTENDANCE_TABLE =
+  'table:has(th:has-text("勤怠状況")), table:has(th:has-text("Attendance Status"))';
+// Leave-applications table: header is 申請No (JP) / "Request No." (EN).
+const LEAVE_TABLE =
+  'table:has(th:has-text("申請No")), table:has(th:has-text("Request No."))';
+// 休暇申請詳細 page: the date row's header is 希望休暇日 (JP) / "Desired Vacation
+// Date" (EN). This is the only place a multi-day request's end date is rendered.
+const LEAVE_DETAIL_DATE_CELL =
+  'tr:has(th:has-text("希望休暇日")) td, tr:has(th:has-text("Desired Vacation Date")) td';
+// Jobcan writes the range separator as a full-width tilde; accept its variants.
+const RANGE_SEPARATOR = /[～〜~]/;
+
+/** True when the 勤怠状況 badge marks an absence: 欠 (JP) / "A" (EN). */
+export function isAbsenceStatus(statusText: string): boolean {
+  const s = statusText.trim();
+  return s.includes("欠") || s === "A";
+}
+
+/** True when a leave application is pending: 承認待ち (JP) / "Waiting for Approval" (EN). */
+export function isPendingApproval(status: string): boolean {
+  const s = status.trim();
+  return s === "承認待ち" || /waiting for approval/i.test(s);
+}
+
+/** Canonicalize a 打刻区分 label so JP and EN stamps compare equal. */
+export function normalizeStampKind(raw: string): "in" | "out" | "" {
+  const s = raw.trim().toLowerCase();
+  if (s.includes("出勤") || s.includes("clock in")) return "in";
+  if (s.includes("退勤") || s.includes("clock out")) return "out";
+  return "";
+}
+
+// --- Date helpers ----------------------------------------------------------
+
+export type YMD = { year: number; month: number; day: number };
+
+const DAY_MS = 86_400_000;
+/** Guard against a malformed end date turning into an unbounded expansion. */
+const MAX_LEAVE_SPAN_DAYS = 366;
+
+/**
+ * Pull every date out of a Jobcan date string, in order of appearance.
+ *
+ * Handles both locales and both renderings Jobcan uses:
+ *   JP list "2026/07/27", EN list "07/27/2026",
+ *   detail page "07 / 27 / 2026 (Mon)～07 / 29 / 2026 (Wed)".
+ * The four-digit group decides which side the year is on; weekday suffixes and
+ * the range separator are ignored.
+ */
+export function parseJobcanDates(raw: string): YMD[] {
+  const out: YMD[] = [];
+  for (const m of raw.matchAll(/(\d{1,4})\s*\/\s*(\d{1,2})\s*\/\s*(\d{1,4})/g)) {
+    const a = Number(m[1]), b = Number(m[2]), c = Number(m[3]);
+    if (m[1].length === 4) out.push({ year: a, month: b, day: c });       // YYYY/MM/DD
+    else if (m[3].length === 4) out.push({ year: c, month: a, day: b });  // MM/DD/YYYY
+  }
+  return out;
+}
+
+function toUtcMs(d: YMD): number {
+  return Date.UTC(d.year, d.month - 1, d.day);
+}
+
+function fromUtcMs(ms: number): YMD {
+  const d = new Date(ms);
+  return { year: d.getUTCFullYear(), month: d.getUTCMonth() + 1, day: d.getUTCDate() };
+}
+
+/** Every calendar day from `start` to `end` inclusive. */
+export function expandDays(start: YMD, end: YMD): YMD[] {
+  const startMs = toUtcMs(start);
+  const endMs = toUtcMs(end);
+  if (!(endMs > startMs)) return [start];
+  const span = Math.min(Math.round((endMs - startMs) / DAY_MS), MAX_LEAVE_SPAN_DAYS);
+  const days: YMD[] = [];
+  for (let i = 0; i <= span; i++) days.push(fromUtcMs(startMs + i * DAY_MS));
+  return days;
+}
+
+function ymdLabel(d: YMD): string {
+  return `${String(d.year).padStart(4, "0")}-${String(d.month).padStart(2, "0")}-${String(d.day).padStart(2, "0")}`;
+}
 
 export async function login(context: BrowserContext, email: string, password: string): Promise<Page> {
   const page = await context.newPage();
@@ -80,13 +178,12 @@ export async function fetchMonthRows(
   month: number,
 ): Promise<AttendanceRow[]> {
   await page.goto(attendanceUrl(year, month), { waitUntil: "domcontentloaded" });
-  // The data table is the one with header 日付 / 出勤時刻 / 勤怠状況.
-  await page.waitForSelector('table:has(th:has-text("勤怠状況"))', { timeout: 15_000 });
+  // The data table is the one with header 日付 / 出勤時刻 / 勤怠状況 ("Attendance Status" in EN).
+  await page.waitForSelector(ATTENDANCE_TABLE, { timeout: 15_000 });
 
   // NOTE: Keep this callback body free of declared-name helpers.
   // tsx/esbuild rewrites named arrow-consts via __name(...) which doesn't exist in the page context.
-  const rows = await page.$$eval(
-    'table:has(th:has-text("勤怠状況")) tbody tr',
+  const rows = await page.locator(ATTENDANCE_TABLE).first().locator("tbody tr").evaluateAll(
     (trs) =>
       trs.map((tr) => {
         const tds = Array.from(tr.querySelectorAll("td"));
@@ -128,7 +225,7 @@ export function planCorrections(
     if (upToDay !== undefined && row.day > upToDay) continue;
 
     const statusBlob = `${row.statusTooltip || ""} ${row.statusText || ""}`;
-    const isKetsu = row.statusText.includes("欠");
+    const isKetsu = isAbsenceStatus(row.statusText);
     const isRW = /(^|[^A-Za-z])RW([^A-Za-z]|$)|在宅勤務|Remote\s*Work/i.test(statusBlob);
     const missingIn = row.clockIn.trim() === "";
     const missingOut = row.clockOut.trim() === "";
@@ -193,20 +290,58 @@ export async function getExistingStamps(
 }
 
 /**
- * Fetch 休暇申請 (leave applications) between two dates (inclusive).
- * Used to detect pending (承認待ち) non-RW applications so we don't
- * accidentally submit 打刻 for days the user is on leave.
+ * Read a request's end date off its 休暇申請詳細 page.
+ *
+ * The 休暇申請一覧 truncates a multi-day request's 希望休暇日 cell to
+ * "07/27/2026～" — the end date is rendered only here. Returns null when the
+ * page shows a single date (or can't be parsed).
+ */
+async function fetchLeaveEndDate(page: Page, appliedId: string): Promise<YMD | null> {
+  await page.goto(`https://ssl.jobcan.jp/employee/holiday/info?applied_id=${appliedId}`, {
+    waitUntil: "domcontentloaded",
+  });
+
+  const labelled = page.locator(LEAVE_DETAIL_DATE_CELL);
+  let dates: YMD[] = [];
+  if (await labelled.count() > 0) {
+    dates = parseJobcanDates((await labelled.first().textContent()) || "");
+  }
+  if (dates.length < 2) {
+    // Locale whose 希望休暇日 label we don't match: fall back to the first cell
+    // on the page holding a "date～date" range.
+    for (const cell of await page.locator("td").allTextContents()) {
+      if (!RANGE_SEPARATOR.test(cell)) continue;
+      const parsed = parseJobcanDates(cell);
+      if (parsed.length >= 2) { dates = parsed; break; }
+    }
+  }
+  return dates.length >= 2 ? dates[1] : null;
+}
+
+/**
+ * Jobcan's term search matches a request by its START date only — a request
+ * that began before the window but runs into it is not returned. Query this
+ * many days earlier than asked, then clip the expanded days to the window.
+ */
+const LEAVE_QUERY_LOOKBACK_DAYS = 62;
+
+/**
+ * Fetch 休暇申請 (leave applications) covering any day between two dates
+ * (inclusive), one entry per covered calendar day. Used to detect pending
+ * (承認待ち) non-RW applications so we don't accidentally submit 打刻 for days
+ * the user is on leave.
  */
 export async function fetchLeaveApplications(
   page: Page,
-  from: { year: number; month: number; day: number },
-  to: { year: number; month: number; day: number },
+  from: YMD,
+  to: YMD,
 ): Promise<LeaveApplication[]> {
+  const queryFrom = fromUtcMs(toUtcMs(from) - LEAVE_QUERY_LOOKBACK_DAYS * DAY_MS);
   const params = new URLSearchParams({
     search_type: "term",
-    "from[y]": String(from.year),
-    "from[m]": String(from.month),
-    "from[d]": String(from.day),
+    "from[y]": String(queryFrom.year),
+    "from[m]": String(queryFrom.month),
+    "from[d]": String(queryFrom.day),
     "to[y]": String(to.year),
     "to[m]": String(to.month),
     "to[d]": String(to.day),
@@ -214,36 +349,69 @@ export async function fetchLeaveApplications(
   const url = `https://ssl.jobcan.jp/employee/holiday?${params.toString()}`;
   await page.goto(url, { waitUntil: "domcontentloaded" });
 
-  // The data table has a column header "申請No". If zero applications exist in
-  // the range, Jobcan omits the table entirely — treat that as an empty list.
-  const tableCount = await page.locator('table:has(th:has-text("申請No"))').count();
+  // The data table's header is 申請No (JP) / "Request No." (EN). If zero
+  // applications exist in the range, Jobcan omits the table entirely — treat
+  // that as an empty list.
+  const tableCount = await page.locator(LEAVE_TABLE).count();
   if (tableCount === 0) return [];
 
-  const rows = await page.$$eval(
-    'table:has(th:has-text("申請No")) tbody tr',
+  // Scrape every row up front — resolving ranges below navigates this page away.
+  const rows = await page.locator(LEAVE_TABLE).first().locator("tbody tr").evaluateAll(
     (trs) =>
       trs.map((tr) => {
         const tds = tr.querySelectorAll("td");
-        const date = ((tds[1] && tds[1].textContent) || "").trim();
-        const status = ((tds[2] && tds[2].textContent) || "").trim();
-        const content = ((tds[3] && tds[3].textContent) || "").trim();
-        return { date, status, content };
+        const link = tds[0] ? tds[0].querySelector("a[href*='applied_id=']") : null;
+        const href = link ? link.getAttribute("href") || "" : "";
+        const idFromHref = href.match(/applied_id=(\d+)/);
+        return {
+          appliedId: idFromHref ? idFromHref[1] : ((tds[0] && tds[0].textContent) || "").trim(),
+          date: ((tds[1] && tds[1].textContent) || "").trim(),
+          status: ((tds[2] && tds[2].textContent) || "").trim(),
+          content: ((tds[3] && tds[3].textContent) || "").trim(),
+        };
       }),
   );
 
-  return rows
-    .filter((r) => /^\d{4}\/\d{2}\/\d{2}/.test(r.date))
-    .map((r) => {
-      const m = r.date.match(/^(\d{4})\/(\d{2})\/(\d{2})/)!;
-      return {
-        year: Number(m[1]),
-        month: Number(m[2]),
-        day: Number(m[3]),
+  const fromMs = toUtcMs(from);
+  const toMs = toUtcMs(to);
+  const leaves: LeaveApplication[] = [];
+
+  for (const r of rows) {
+    const dates = parseJobcanDates(r.date);
+    if (dates.length === 0) continue;
+    const start = dates[0];
+    let end: YMD | null = dates[1] ?? null;
+
+    // A bare separator with no second date means the list truncated a range.
+    if (!end && RANGE_SEPARATOR.test(r.date)) {
+      end = r.appliedId ? await fetchLeaveEndDate(page, r.appliedId) : null;
+      if (!end) {
+        console.warn(
+          `   ! 休暇申請 #${r.appliedId || "?"} (${r.date}) spans multiple days but its end date could not be read — treating it as ${ymdLabel(start)} only.`,
+        );
+      }
+    }
+
+    const days = expandDays(start, end ?? start);
+    const spanLabel = days.length > 1
+      ? `${ymdLabel(days[0])}..${ymdLabel(days[days.length - 1])}`
+      : undefined;
+
+    for (const d of days) {
+      const ms = toUtcMs(d);
+      if (ms < fromMs || ms > toMs) continue; // clip the lookback / overrun back to the window
+      leaves.push({
+        ...d,
         status: r.status,
         content: r.content,
         isRemoteWork: /在宅勤務|Remote\s*Work/i.test(r.content),
-      };
-    });
+        appliedId: r.appliedId,
+        spanLabel,
+      });
+    }
+  }
+
+  return leaves;
 }
 
 /** Submit one 打刻 (either 出勤 or 退勤). */

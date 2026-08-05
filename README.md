@@ -141,6 +141,23 @@ RW applications (`在宅勤務/Remote Work`) are intentionally **not** filtered
 out: whether pending or approved, RW days still need 出勤 / 退勤 打刻 on
 打刻修正, so the normal planning + dedup flow applies to them.
 
+### Multi-day requests
+
+Two quirks of 休暇申請一覧 make multi-day requests easy to under-count, and
+both are handled in `fetchLeaveApplications`:
+
+- The list **truncates the range**: a 07/27–07/29 request renders its
+  希望休暇日 cell as `07/27/2026～`, with no end date. The end date exists only
+  on the request's detail page (`/employee/holiday/info?applied_id=…`), so a
+  cell ending in a bare `～` triggers a fetch of that page. The request is then
+  expanded into one entry per covered calendar day, which is what the report
+  and the date-blocking filter both consume.
+- The term search **matches on the start date only**: a window of
+  `07/28 .. 07/28` returns nothing for a request spanning 07/27–07/29. The
+  query therefore starts 62 days before the requested `from`, and the expanded
+  days are clipped back to the real window — otherwise a leave that began in
+  the previous month would be invisible to the scan.
+
 ## Project layout
 
 ```
