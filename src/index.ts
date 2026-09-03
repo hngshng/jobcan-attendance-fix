@@ -58,7 +58,10 @@ function ymd(year: number, month: number, day: number): string {
  * Report every day covered by a 休暇申請 (leave/vacation request) in the scan
  * window with its approval status, and whether the tool records 打刻 time for it:
  *   - 在宅勤務/Remote Work (RW): still a working day → time IS recorded.
- *   - any other vacation (Sick, PTO, …): a day off → time is NOT recorded.
+ *   - a half-day (午前/AM or 午後/PM) vacation: the other half is worked →
+ *     time IS recorded, for that half only.
+ *   - any other vacation (Sick, PTO, …) taken as 全休/Full Day: a day off →
+ *     time is NOT recorded.
  * A multi-day request contributes one row per day, tagged with its span.
  */
 function printLeaveTable(leaves: LeaveApplication[]) {
@@ -76,7 +79,11 @@ function printLeaveTable(leaves: LeaveApplication[]) {
     (a, b) => a.year - b.year || a.month - b.month || a.day - b.day,
   );
   for (const l of sorted) {
-    const timeRecorded = l.isRemoteWork ? "yes (working day)" : "no (day off)";
+    const timeRecorded = l.isRemoteWork
+      ? "yes (working day)"
+      : l.half
+        ? `yes (${l.half === "am" ? "PM" : "AM"} half)`
+        : "no (day off)";
     const tag = l.spanLabel ? `  [#${l.appliedId} ${l.spanLabel}]` : "";
     console.log(
       `  ${ymd(l.year, l.month, l.day)}  | ${l.status.padEnd(20)} | ${timeRecorded.padEnd(17)} | ${l.content}${tag}`,

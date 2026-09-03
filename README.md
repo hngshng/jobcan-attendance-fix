@@ -9,9 +9,15 @@ default clock-in/out times, asks for your approval, and submits them via the
 - Scans the **previous month** in full. If the previous month is fully input,
   it also scans the **current month up to yesterday**.
 - A day needs input when either:
-  - 勤怠状況 is `欠` (day not stamped at all), or
+  - 勤怠状況 carries the absence badge `欠` / `A` (that half of the day is not
+    stamped), or
   - 勤怠状況 indicates RW (`在宅勤務/Remote Work`) **and** at least one of
     出勤時刻 / 退勤時刻 is blank. Only the blank side(s) are submitted.
+- The 勤怠状況 cell can hold **more than one badge**. An approved half-day 休暇
+  renders the leave badge next to the absence badge — `病A` for a 午後/PM sick
+  leave — because the worked half is still unstamped. Such a day is a normal
+  candidate, filled with the half-day times below. A `全休/Full Day` leave shows
+  the leave badge alone (`病`, no `A`) and is left untouched.
 - Skips weekends and national holidays (they never show 欠 or RW-with-blanks).
 - Skips dates with a pending (`承認待ち`) non-RW entry on 休暇申請一覧.
   Pending leave applications don't yet show on 出勤簿's 勤怠状況 column, so
@@ -25,14 +31,19 @@ default clock-in/out times, asks for your approval, and submits them via the
 
 ## Default times
 
-The same time rules apply to both 欠 and RW-with-blanks. For RW rows, only
-the missing side is submitted (so the pre-existing one is untouched).
+The same time rules apply to 欠, half-day 休暇 and RW-with-blanks. Only the
+missing side is ever submitted, so a pre-existing stamp is untouched.
 
 | 勤怠状況 (tooltip) | 出勤時刻 | 退勤時刻 |
 | --- | --- | --- |
 | Full day (欠, or RW with both blank) | 09:00 | 18:00 |
 | Contains `午前/AM` (AM off, work PM) | 14:00 | 18:00 |
 | Contains `午後/PM` (PM off, work AM) | 09:00 | 14:00 |
+
+The half-day rows are driven by the 勤怠状況 tooltip, e.g.
+`病気休暇/Sick Leave (午後/PM)` → 09:00–14:00. Jobcan only writes that tooltip
+once the request is **approved**; while it is 承認待ち the day is blocked
+entirely (see below) and picked up on a later run.
 
 ## Prerequisites
 

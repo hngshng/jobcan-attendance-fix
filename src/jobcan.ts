@@ -59,6 +59,7 @@ export type LeaveApplication = {
   status: string;      // "承認", "承認待ち", "却下"
   content: string;     // e.g. "病気休暇/Sick Leave (全休/Full Day)", "在宅勤務/Remote Work"
   isRemoteWork: boolean;
+  half: LeaveHalf;     // "am" / "pm" for a half-day request, null for a full day
   appliedId: string;   // 申請No — the applied_id of the request this day came from
   spanLabel?: string;  // "2026-07-27..2026-07-29", set only for multi-day requests
 };
@@ -83,10 +84,31 @@ const LEAVE_DETAIL_DATE_CELL =
 // Jobcan writes the range separator as a full-width tilde; accept its variants.
 const RANGE_SEPARATOR = /[～〜~]/;
 
-/** True when the 勤怠状況 badge marks an absence: 欠 (JP) / "A" (EN). */
+/**
+ * True when the 勤怠状況 badge marks an absence: 欠 (JP) / "A" (EN).
+ *
+ * The cell can hold more than one badge. A half-day 休暇 renders the leave
+ * badge next to the absence badge — "病A" for an approved 午後/PM sick leave —
+ * because the other half of the day is still unstamped. Match the badge as a
+ * token inside the cell, not as the whole cell.
+ */
 export function isAbsenceStatus(statusText: string): boolean {
   const s = statusText.trim();
-  return s.includes("欠") || s === "A";
+  return s.includes("欠") || /\bA\b/.test(s);
+}
+
+/** Which half of the day a 休暇 covers, or null for a full day. */
+export type LeaveHalf = "am" | "pm" | null;
+
+/**
+ * Read the half-day marker out of a 勤怠状況 tooltip or a 休暇申請 content
+ * string — "病気休暇/Sick Leave (午後/PM)" → "pm" (afternoon off, morning worked).
+ * A full-day leave reads "(全休/Full Day)" and yields null.
+ */
+export function detectLeaveHalf(text: string): LeaveHalf {
+  if (/午前|\bAM\b/i.test(text)) return "am";
+  if (/午後|\bPM\b/i.test(text)) return "pm";
+  return null;
 }
 
 /** True when a leave application is pending: 承認待ち (JP) / "Waiting for Approval" (EN). */
@@ -234,15 +256,19 @@ export function planCorrections(
     const needsFill = isKetsu || (isRW && (missingIn || missingOut));
     if (!needsFill) continue;
 
-    // Default times; AM/PM tooltips shift the expected range.
+    // Default times; a half-day 休暇 shifts the expected range to the half
+    // that was actually worked. An approved 午後/PM leave shows as "病A" with
+    // the half in the tooltip, so the 欠 branch above already caught the row —
+    // only the times differ.
     let targetIn = "09:00";
     let targetOut = "18:00";
     let reason: Correction["reason"] = isKetsu ? "full" : "rw-partial";
-    if (/午前|AM/i.test(statusBlob)) {
+    const half = detectLeaveHalf(statusBlob);
+    if (half === "am") {
       reason = "am-off";
       targetIn = "14:00";
       targetOut = "18:00";
-    } else if (/午後|PM/i.test(statusBlob)) {
+    } else if (half === "pm") {
       reason = "pm-off";
       targetIn = "09:00";
       targetOut = "14:00";
@@ -405,6 +431,7 @@ export async function fetchLeaveApplications(
         status: r.status,
         content: r.content,
         isRemoteWork: /在宅勤務|Remote\s*Work/i.test(r.content),
+        half: detectLeaveHalf(r.content),
         appliedId: r.appliedId,
         spanLabel,
       });
