@@ -82,6 +82,18 @@ async function main() {
   await page.screenshot({ path: join(OUT_DIR, "04-modify.png"), fullPage: true });
   await writeFile(join(OUT_DIR, "04-modify.html"), await page.content());
 
+  // The 打刻 form lives in a modal opened by 新規打刻 / "Add New Clocking";
+  // dump it open as well so #ter_time / #insert_button can be inspected.
+  const opener = page.locator('a[onclick*="intoModifyMode()"]');
+  if ((await opener.count()) > 0) {
+    console.log("→ Opening the 打刻 modal (no submission)");
+    await opener.first().click();
+    await page.waitForSelector("#modifyModal.show", { timeout: 10_000 }).catch(() => {});
+    await page.waitForTimeout(1000);
+    await page.screenshot({ path: join(OUT_DIR, "04b-modify-modal.png"), fullPage: true });
+    await writeFile(join(OUT_DIR, "04b-modify-modal.html"), await page.content());
+  }
+
   console.log("→ Done. Artifacts in ./" + OUT_DIR);
   await browser.close();
 }

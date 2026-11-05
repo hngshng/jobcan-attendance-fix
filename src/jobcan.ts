@@ -441,13 +441,26 @@ export async function fetchLeaveApplications(
   return leaves;
 }
 
+// 打刻修正 page. Since Jobcan's late-2026 redesign the 打刻 form (#modifyForm,
+// holding #ter_time and #insert_button) sits inside the Bootstrap modal
+// #modifyModal, which is hidden until the 新規打刻 / "Add New Clocking" link
+// runs intoModifyMode(). The onclick attribute is the one locale-independent
+// hook for that link. The button itself now reads 申請 / "Requests" and calls
+// applyAditWithSelectionRemarks(form) → adit(form), which still POSTs the form
+// to /employee/adit/insert/.
+const MODIFY_MODAL_OPENER = 'a[onclick*="intoModifyMode()"]';
+const MODIFY_MODAL_SHOWN = "#modifyModal.show";
+
 /** Submit one 打刻 (either 出勤 or 退勤). */
 async function punchOnce(page: Page, year: number, month: number, day: number, hhmm: string) {
   await page.goto(modifyUrl(year, month, day), { waitUntil: "domcontentloaded" });
-  await page.waitForSelector("#ter_time", { timeout: 15_000 });
+  await page.waitForSelector("#logs-table", { timeout: 15_000 });
+  // Open the modal first — #ter_time exists in the DOM but is not visible (and
+  // therefore not fillable) until then.
+  await page.click(MODIFY_MODAL_OPENER);
+  await page.waitForSelector(MODIFY_MODAL_SHOWN, { timeout: 10_000 });
   await page.fill("#ter_time", hhmm);
-  // The 打刻 button is an <input type="button"> that triggers AJAX via adit(form).
-  // We click it and wait for the response to come back — the endpoint is /employee/adit/insert/.
+  // The 申請/"Requests" button submits via AJAX; wait for the POST to /employee/adit/insert/.
   const responsePromise = page.waitForResponse(
     (res) => res.url().includes("/employee/adit/insert") && res.request().method() === "POST",
     { timeout: 15_000 },
@@ -457,7 +470,20 @@ async function punchOnce(page: Page, year: number, month: number, day: number, h
   if (!res.ok()) {
     throw new Error(`打刻 POST returned ${res.status()} for ${year}-${month}-${day} ${hhmm}`);
   }
-  // Give the UI a moment to settle.
+  // Validation failures (closed month, duplicate time, required note, …) come
+  // back as HTTP 200 with {result: false, errors: {field: code}} — surface them
+  // instead of reporting success.
+  let body: { result?: boolean; error?: unknown; errors?: Record<string, string> } | null = null;
+  try {
+    body = await res.json();
+  } catch {
+    // Non-JSON body: fall through and trust the HTTP status, as before.
+  }
+  if (body && (body.error || body.result === false)) {
+    const detail = body.errors ? JSON.stringify(body.errors) : JSON.stringify(body);
+    throw new Error(`打刻 rejected for ${year}-${month}-${day} ${hhmm}: ${detail}`);
+  }
+  // Give the UI a moment to settle (Jobcan may reload the page on success).
   await page.waitForTimeout(500);
 }
 

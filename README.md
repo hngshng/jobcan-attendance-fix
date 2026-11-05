@@ -112,9 +112,13 @@ pnpm start
 Scans, prints the correction table, prompts `y/N`. On `y`, for each date it:
 
 1. Opens `https://ssl.jobcan.jp/employee/adit/modify?year=Y&month=M&day=D`
-2. Types `HHMM` (e.g. `0900`) into the 時刻 field.
-3. Clicks the 打刻 button (Jobcan auto-detects 出勤 vs 退勤).
-4. Repeats with the clock-out time.
+2. Clicks 新規打刻 / "Add New Clocking", which opens the 打刻 modal.
+3. Types `HHMM` (e.g. `0900`) into the 時刻 field.
+4. Clicks the 申請 / "Requests" button (Jobcan auto-detects 出勤 vs 退勤).
+5. Repeats with the clock-out time.
+
+A submission that Jobcan rejects (closed month, duplicate time, required
+note, …) is reported as `✗ failed` with the error keys Jobcan returned.
 
 ### Exploration / debugging
 
@@ -199,10 +203,16 @@ both are handled in `fetchLeaveApplications`:
   `__name()` helpers into named arrow-const helpers inside browser callbacks.
   Keep those callbacks free of declared-name helpers (see the comment in
   `src/jobcan.ts`).
+- **`page.fill: Timeout … waiting for locator('#ter_time')` on every date** —
+  the 打刻 form sits inside a modal that is hidden until 新規打刻 / "Add New
+  Clocking" is clicked (Jobcan redesign, late 2026). `punchOnce` opens the
+  modal first; if the opener link changes, update `MODIFY_MODAL_OPENER` in
+  `src/jobcan.ts`.
 - **Selectors broken after a Jobcan update** — re-run `pnpm explore` and
-  inspect the dumps in `./exploration/` to find the new markup, then update
-  `fetchMonthRows` / `getExistingStamps` / `fetchLeaveApplications` / the
-  modify-form selectors.
+  inspect the dumps in `./exploration/` to find the new markup
+  (`04b-modify-modal.html` shows the 打刻 modal open), then update
+  `fetchMonthRows` / `getExistingStamps` / `fetchLeaveApplications` /
+  `punchOnce`.
 
 ## Safety notes
 
