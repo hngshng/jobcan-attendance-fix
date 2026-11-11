@@ -180,7 +180,11 @@ A run:
    then clicks Request, which POSTs to `/employee/holiday/save`.
 5. Re-reads 休暇申請一覧 and reports the new 申請No. If no new request shows
    up, it says the request was sent but not verified, so check Jobcan before
-   retrying.
+   retrying. A save Jobcan accepts lands on `/employee/holiday/finish`; a
+   rejected one lands on `/employee/holiday/new?back=1&error=1`, which shows
+   the reason only once. For any page other than the finish page, the error
+   quotes Jobcan's message, hidden error boxes included, and names the copy
+   saved as `exploration/leave-save-<time>.html` (plus a `.png`).
 
 Jobcan caps a range at 40 working days and greys out "Go to Review Page"
 beyond that; the tool reports the on-page error.

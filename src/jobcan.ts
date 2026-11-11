@@ -1,4 +1,6 @@
 import type { BrowserContext, Page } from "playwright";
+import { mkdir, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 
 const SIGN_IN_URL = "https://id.jobcan.jp/users/sign_in";
 const SSO_URL = "https://ssl.jobcan.jp/jbcoauth/login";
@@ -505,7 +507,10 @@ export async function applyCorrection(page: Page, c: Correction) {
 //      (#submit-button) POSTs it to /employee/holiday/confirm.
 //   2. The review page renders a read-only summary plus #form1, whose "Request"
 //      button (onclick="return submitForm();") POSTs to /employee/holiday/save.
-//      Only that second POST creates the request.
+//      Only that second POST creates the request. It redirects to
+//      /employee/holiday/finish when Jobcan accepts the request, or to
+//      /employee/holiday/new?back=1&error=1 when it rejects it; that page
+//      shows the reason once and a reload no longer does.
 // A date range is offered for full-day vacation types only: ticking
 // #scheduleCheckbox (期間指定 / "Specify the time period") reveals the
 // to_holiday_* selects. Half-day types are always a single date. Jobcan's own
@@ -552,6 +557,7 @@ const LEAVE_TYPE_SELECT = 'select[name="holiday_id[0]"]';
 const LEAVE_RANGE_CHECKBOX = "#scheduleCheckbox";
 const LEAVE_REVIEW_FORM = 'form#form1[action*="/employee/holiday/save"]';
 const LEAVE_REVIEW_SUBMIT = '#form1 input[type="button"][onclick*="submitForm"]';
+const LEAVE_SAVED_PATH = "/employee/holiday/finish";
 // Review-page row labels (JP / EN).
 const REVIEW_NAME_LABEL = /休暇名|Vacation Name/i;
 const REVIEW_DATE_LABEL = /希望休暇日|休暇希望日|Desired Vacation Date/i;
@@ -601,6 +607,35 @@ async function visibleFormErrors(page: Page): Promise<string> {
     .locator(".invalid-feedback:visible, .alert:visible, .jbc-text-danger:visible")
     .allTextContents();
   return texts.map(collapseWhitespace).filter((t) => t !== "" && t !== "(Required)" && t !== "(必須)").join(" / ");
+}
+
+/**
+ * Error text on a Jobcan form page, hidden boxes included. After a rejected
+ * save Jobcan renders its message once, on the page it redirects to, and may
+ * put it in an .invalid-feedback box that its CSS keeps hidden. The date-range
+ * boxes (#error-calendar*) always carry fixed client-side text, so they count
+ * only while shown.
+ */
+async function allFormErrors(page: Page): Promise<string> {
+  const texts = await page
+    .locator(".invalid-feedback, .alert, .jbc-text-danger, .noty_text")
+    .evaluateAll((els) =>
+      els
+        .filter((el) => !(el.id.startsWith("error-calendar") && (el as HTMLElement).offsetParent === null))
+        .map((el) => el.textContent || ""),
+    );
+  const kept = texts.map(collapseWhitespace).filter((t) => t !== "" && t !== "(Required)" && t !== "(必須)");
+  return [...new Set(kept)].join(" / ");
+}
+
+/** Keep the page Jobcan showed after an unconfirmed save (HTML + screenshot) under exploration/. */
+async function saveLeaveSavePage(page: Page): Promise<string> {
+  const dir = "exploration";
+  await mkdir(dir, { recursive: true });
+  const base = join(dir, `leave-save-${new Date().toISOString().replace(/[:.]/g, "-")}`);
+  await writeFile(`${base}.html`, await page.content());
+  await page.screenshot({ path: `${base}.png`, fullPage: true });
+  return `${base}.html`;
 }
 
 async function selectDate(page: Page, prefix: "" | "to_", d: YMD) {
@@ -748,8 +783,15 @@ export async function createLeaveRequest(
   if (saveRes.status() >= 400) {
     throw new Error(`Request was sent but /employee/holiday/save answered HTTP ${saveRes.status()} — check 休暇申請一覧 before retrying`);
   }
-  const saveErrors = await visibleFormErrors(page);
   const savedAt = page.url();
+  // Anywhere but the finish page, read Jobcan's message and keep the page now:
+  // verification below navigates away, and the message isn't shown again.
+  let saveErrors = "";
+  let savedPage = "";
+  if (new URL(savedAt).pathname !== LEAVE_SAVED_PATH) {
+    saveErrors = await allFormErrors(page).catch(() => "");
+    savedPage = await saveLeaveSavePage(page).catch(() => "");
+  }
 
   // 5. Verify on 休暇申請一覧.
   const after = await fetchLeaveApplications(page, req.from, req.to);
@@ -757,9 +799,12 @@ export async function createLeaveRequest(
     (l) => !knownIds.has(l.appliedId) && sameText(l.content, option.text),
   );
   if (created.length === 0) {
+    const rejected = new URL(savedAt).searchParams.get("error") === "1";
     throw new Error(
       `Request was sent but no new "${option.text}" request appeared on 休暇申請一覧 for ${wantDates.map(ymdLabel).join("..")} ` +
-        `(after saving: ${savedAt}${saveErrors ? `; page said: ${saveErrors}` : ""}) — check Jobcan before retrying`,
+        `(after saving: ${savedAt}${rejected ? ", which is Jobcan's rejection page" : ""}` +
+        `; Jobcan said: ${saveErrors || "no error text found on the page"}` +
+        `${savedPage ? `; page saved to ${savedPage}` : ""}) — check Jobcan before retrying`,
     );
   }
   return { review, submitted: true, created };
