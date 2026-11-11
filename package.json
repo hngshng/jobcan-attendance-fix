@@ -6,6 +6,7 @@
   "scripts": {
     "start": "tsx src/index.ts",
     "dry-run": "tsx src/index.ts --dry-run",
+    "leave": "tsx src/request-leave.ts",
     "explore": "tsx src/explore.ts"
   },
   "dependencies": {

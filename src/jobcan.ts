@@ -497,3 +497,270 @@ export async function applyCorrection(page: Page, c: Correction) {
     await punchOnce(page, year, month, day, s.time.replace(":", ""));
   }
 }
+
+// --- 休暇申請 (new vacation request) ----------------------------------------
+// A two-step form:
+//   1. /employee/holiday/new — prefilled with the start date from
+//      ?holiday_year=&holiday_month=&holiday_day=. "Go to Review Page"
+//      (#submit-button) POSTs it to /employee/holiday/confirm.
+//   2. The review page renders a read-only summary plus #form1, whose "Request"
+//      button (onclick="return submitForm();") POSTs to /employee/holiday/save.
+//      Only that second POST creates the request.
+// A date range is offered for full-day vacation types only: ticking
+// #scheduleCheckbox (期間指定 / "Specify the time period") reveals the
+// to_holiday_* selects. Half-day types are always a single date. Jobcan's own
+// JS disables #submit-button when a range exceeds 40 working days.
+
+/** The vacation types the leave CLI supports. */
+export type LeaveKind = "rw" | "pto" | "sick";
+
+export type LeaveRequest = {
+  kind: LeaveKind;
+  half: LeaveHalf;  // "am" = morning off, "pm" = afternoon off, null = full day
+  from: YMD;
+  to: YMD;          // equal to `from` for a single day
+  reason: string;   // "" for none
+};
+
+/** Label → value rows of Jobcan's review page, in page order. */
+export type LeaveReview = { vacationName: string; rows: [string, string][] };
+
+export type LeaveRequestResult = {
+  review: LeaveReview;
+  submitted: boolean;
+  /** Requests that appeared on 休暇申請一覧 after saving, one entry per covered day. */
+  created: LeaveApplication[];
+};
+
+/** Thrown when an active request already covers one of the requested days. */
+export class LeaveOverlapError extends Error {
+  constructor(readonly overlapping: LeaveApplication[]) {
+    super(`${overlapping.length} requested day(s) are already covered by an active 休暇申請`);
+  }
+}
+
+// Vacation names are configured per company and render the same in either UI
+// language ("PTO (全休/Full Day)", "病気休暇/Sick Leave (午後/PM)",
+// "在宅勤務/Remote Work"), so match on the name; option values are internal IDs.
+const LEAVE_KIND_PATTERN: Record<LeaveKind, RegExp> = {
+  rw: /在宅勤務|Remote\s*Work/i,
+  pto: /\bPTO\b/i,
+  sick: /病気休暇|Sick\s*Leave/i,
+};
+
+const LEAVE_TYPE_SELECT = 'select[name="holiday_id[0]"]';
+const LEAVE_RANGE_CHECKBOX = "#scheduleCheckbox";
+const LEAVE_REVIEW_FORM = 'form#form1[action*="/employee/holiday/save"]';
+const LEAVE_REVIEW_SUBMIT = '#form1 input[type="button"][onclick*="submitForm"]';
+// Review-page row labels (JP / EN).
+const REVIEW_NAME_LABEL = /休暇名|Vacation Name/i;
+const REVIEW_DATE_LABEL = /希望休暇日|休暇希望日|Desired Vacation Date/i;
+const REVIEW_REASON_LABEL = /休暇理由|Reason for Vacation/i;
+
+/** A request that no longer blocks its days: 却下 / Rejected, or cancelled. */
+export function isInactiveLeaveStatus(status: string): boolean {
+  return /却下|取消|取り消|reject|cancel/i.test(status);
+}
+
+/**
+ * Pick the one 休暇名 option for a kind + half: "pto" + "pm" → "PTO(午後/PM Off)".
+ * Throws when the account offers none or several, listing what is available.
+ */
+export function pickVacationOption(
+  options: { value: string; text: string }[],
+  kind: LeaveKind,
+  half: LeaveHalf,
+): { value: string; text: string } {
+  const matches = options.filter(
+    (o) => o.value !== "" && LEAVE_KIND_PATTERN[kind].test(o.text) && detectLeaveHalf(o.text) === half,
+  );
+  if (matches.length === 1) return matches[0];
+  const want = `${kind}${half ? ` (${half.toUpperCase()} off)` : " (full day)"}`;
+  const available = options.filter((o) => o.value !== "").map((o) => `  ${o.value}: ${o.text}`).join("\n");
+  throw new Error(
+    `${matches.length === 0 ? "No" : "More than one"} 休暇名 option matches ${want}. Available:\n${available}`,
+  );
+}
+
+export function ymdEquals(a: YMD, b: YMD): boolean {
+  return a.year === b.year && a.month === b.month && a.day === b.day;
+}
+
+function collapseWhitespace(s: string): string {
+  return s.replace(/\s+/g, " ").trim();
+}
+
+/** For comparing what we typed with what Jobcan echoes: <br> and wrapping drop or add whitespace. */
+function sameText(a: string, b: string): boolean {
+  return a.replace(/\s+/g, "") === b.replace(/\s+/g, "");
+}
+
+/** Visible error text on a Jobcan form page, for error messages. */
+async function visibleFormErrors(page: Page): Promise<string> {
+  const texts = await page
+    .locator(".invalid-feedback:visible, .alert:visible, .jbc-text-danger:visible")
+    .allTextContents();
+  return texts.map(collapseWhitespace).filter((t) => t !== "" && t !== "(Required)" && t !== "(必須)").join(" / ");
+}
+
+async function selectDate(page: Page, prefix: "" | "to_", d: YMD) {
+  // Year → month → day: each onchange re-clamps the day list to the month.
+  await page.selectOption(`#${prefix}holiday_year`, String(d.year));
+  await page.selectOption(`#${prefix}holiday_month`, String(d.month));
+  await page.selectOption(`#${prefix}holiday_day`, String(d.day));
+}
+
+async function readDate(page: Page, prefix: "" | "to_"): Promise<YMD> {
+  return {
+    year: Number(await page.inputValue(`#${prefix}holiday_year`)),
+    month: Number(await page.inputValue(`#${prefix}holiday_month`)),
+    day: Number(await page.inputValue(`#${prefix}holiday_day`)),
+  };
+}
+
+/**
+ * File a 休暇申請 through the two-step form.
+ *
+ * Before touching the form it reads 休暇申請一覧 for the requested days and
+ * throws LeaveOverlapError if an active (not 却下) request already covers one,
+ * unless `allowOverlap`. It then fills the form, opens the review page and
+ * checks that Jobcan echoes back the chosen vacation name, dates and reason.
+ * `onReview` sees that summary and decides whether to press Request; returning
+ * false (dry-run, declined prompt) leaves without saving anything.
+ *
+ * After saving, the new request is confirmed by re-reading 休暇申請一覧 for an
+ * 申請No that wasn't there before. Errors raised after the Request click say so,
+ * because the request may exist even though verification failed.
+ */
+export async function createLeaveRequest(
+  page: Page,
+  req: LeaveRequest,
+  opts: { allowOverlap?: boolean; onReview?: (review: LeaveReview) => Promise<boolean> } = {},
+): Promise<LeaveRequestResult> {
+  const isRange = toUtcMs(req.to) !== toUtcMs(req.from);
+  if (toUtcMs(req.to) < toUtcMs(req.from)) {
+    throw new Error(`End date ${ymdLabel(req.to)} is before start date ${ymdLabel(req.from)}`);
+  }
+  if (req.kind === "rw" && req.half) throw new Error("Remote Work has no half-day variant");
+  if (req.half && isRange) {
+    throw new Error("Jobcan takes a half-day vacation for one date at a time; file one request per date");
+  }
+
+  // 1. Existing requests for these days: overlap check + baseline for verification.
+  const before = await fetchLeaveApplications(page, req.from, req.to);
+  const overlapping = before.filter((l) => !isInactiveLeaveStatus(l.status));
+  if (overlapping.length > 0 && !opts.allowOverlap) throw new LeaveOverlapError(overlapping);
+  const knownIds = new Set(before.map((l) => l.appliedId));
+
+  // 2. Fill the form.
+  const params = new URLSearchParams({
+    holiday_year: String(req.from.year),
+    holiday_month: String(req.from.month),
+    holiday_day: String(req.from.day),
+  });
+  await page.goto(`https://ssl.jobcan.jp/employee/holiday/new?${params.toString()}`, {
+    waitUntil: "domcontentloaded",
+  });
+  await page.waitForSelector(LEAVE_TYPE_SELECT, { timeout: 15_000 });
+
+  const options = await page.$$eval(`${LEAVE_TYPE_SELECT} option`, (os) =>
+    os.map((o) => ({ value: (o as HTMLOptionElement).value, text: (o.textContent || "").trim() })),
+  );
+  const option = pickVacationOption(options, req.kind, req.half);
+  await page.selectOption(LEAVE_TYPE_SELECT, option.value);
+
+  if (!ymdEquals(await readDate(page, ""), req.from)) await selectDate(page, "", req.from);
+  if (!ymdEquals(await readDate(page, ""), req.from)) {
+    throw new Error(`Could not set the start date to ${ymdLabel(req.from)}`);
+  }
+
+  if (isRange) {
+    const rangeBox = page.locator(LEAVE_RANGE_CHECKBOX);
+    if ((await rangeBox.count()) === 0) {
+      throw new Error(`"${option.text}" does not offer a date range (期間指定) on Jobcan`);
+    }
+    await rangeBox.check();
+    await page.waitForSelector("#toDisplay", { state: "visible", timeout: 5_000 });
+    await selectDate(page, "to_", req.to);
+    if (!ymdEquals(await readDate(page, "to_"), req.to)) {
+      throw new Error(`Could not set the end date to ${ymdLabel(req.to)}`);
+    }
+  }
+
+  if (req.reason) await page.fill("#description", req.reason);
+
+  if (await page.locator("#submit-button").isDisabled()) {
+    throw new Error(`Jobcan disabled "Go to Review Page": ${(await visibleFormErrors(page)) || "no message shown"}`);
+  }
+
+  // 3. Review page — Jobcan validates server-side here; a rejected form comes
+  //    back re-rendered with errors instead of the review form.
+  await Promise.all([
+    // A server-side rejection may not land on /confirm; fall through to the form check.
+    page.waitForURL(/\/employee\/holiday\/confirm/, { timeout: 15_000, waitUntil: "domcontentloaded" }).catch(() => {}),
+    page.click("#submit-button"),
+  ]);
+  if ((await page.locator(LEAVE_REVIEW_FORM).count()) === 0) {
+    throw new Error(`Jobcan did not accept the form: ${(await visibleFormErrors(page)) || `no review page (at ${page.url()})`}`);
+  }
+
+  const rows = (await page.locator(".card-body table tr").evaluateAll((trs) =>
+    trs.map((tr) => {
+      const th = tr.querySelector("th");
+      const td = tr.querySelector("td");
+      return [((th && th.textContent) || "").trim(), ((td && td.textContent) || "").trim()];
+    }),
+  )) as [string, string][];
+  const valueOf = (label: RegExp) => rows.find(([k]) => label.test(k))?.[1] ?? "";
+  const review: LeaveReview = { vacationName: option.text, rows };
+
+  const shownName = valueOf(REVIEW_NAME_LABEL);
+  if (!sameText(shownName, option.text)) {
+    throw new Error(`Review page shows vacation "${shownName}", expected "${option.text}"`);
+  }
+  const shownDates = parseJobcanDates(valueOf(REVIEW_DATE_LABEL));
+  const wantDates = isRange ? [req.from, req.to] : [req.from];
+  if (shownDates.length !== wantDates.length || !shownDates.every((d, i) => ymdEquals(d, wantDates[i]))) {
+    throw new Error(
+      `Review page shows dates "${valueOf(REVIEW_DATE_LABEL)}", expected ${wantDates.map(ymdLabel).join(" ～ ")}`,
+    );
+  }
+  if (req.reason && !sameText(valueOf(REVIEW_REASON_LABEL), req.reason)) {
+    throw new Error(`Review page shows reason "${valueOf(REVIEW_REASON_LABEL)}", expected "${req.reason}"`);
+  }
+
+  if (opts.onReview && !(await opts.onReview(review))) {
+    return { review, submitted: false, created: [] };
+  }
+
+  // 4. Save.
+  const savePromise = page.waitForResponse(
+    (res) => res.url().includes("/employee/holiday/save") && res.request().method() === "POST",
+    { timeout: 20_000 },
+  );
+  const leftReview = page.waitForURL((u) => !u.pathname.startsWith("/employee/holiday/confirm"), {
+    timeout: 20_000,
+    waitUntil: "domcontentloaded",
+  });
+  await page.click(LEAVE_REVIEW_SUBMIT);
+  const saveRes = await savePromise;
+  await leftReview.catch(() => {});
+  if (saveRes.status() >= 400) {
+    throw new Error(`Request was sent but /employee/holiday/save answered HTTP ${saveRes.status()} — check 休暇申請一覧 before retrying`);
+  }
+  const saveErrors = await visibleFormErrors(page);
+  const savedAt = page.url();
+
+  // 5. Verify on 休暇申請一覧.
+  const after = await fetchLeaveApplications(page, req.from, req.to);
+  const created = after.filter(
+    (l) => !knownIds.has(l.appliedId) && sameText(l.content, option.text),
+  );
+  if (created.length === 0) {
+    throw new Error(
+      `Request was sent but no new "${option.text}" request appeared on 休暇申請一覧 for ${wantDates.map(ymdLabel).join("..")} ` +
+        `(after saving: ${savedAt}${saveErrors ? `; page said: ${saveErrors}` : ""}) — check Jobcan before retrying`,
+    );
+  }
+  return { review, submitted: true, created };
+}

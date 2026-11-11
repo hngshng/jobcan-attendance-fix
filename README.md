@@ -130,6 +130,61 @@ markup changes and selectors break.
 pnpm explore
 ```
 
+## Vacation requests (休暇申請)
+
+`pnpm leave` files a new request on
+<https://ssl.jobcan.jp/employee/holiday/new> for the three vacation types in
+regular use. The `/jobcan-vacation-request` Claude Code skill
+(`.claude/skills/jobcan-vacation-request/`) asks for the details, polishes the
+reason, and confirms with you before running it.
+
+```bash
+# Remote work, one day
+pnpm leave --type=rw --from=2026-11-20 --reason="Waiting for a delivery at home."
+
+# PTO across a date range (full-day types only)
+pnpm leave --type=pto --from=2026-12-24 --to=2026-12-28
+
+# Afternoon off sick (half days are one date per request)
+pnpm leave --type=sick --from=2026-11-12 --half=pm --reason="I have a doctor's appointment."
+
+# Fill the form and stop at Jobcan's review page
+pnpm leave --dry-run --type=rw --from=2026-11-20 --reason="…"
+```
+
+| `--type` | `--half` | Jobcan 休暇名 |
+| --- | --- | --- |
+| `rw` | — | 在宅勤務/Remote Work |
+| `pto` | — / `am` / `pm` | PTO (全休/Full Day) / PTO(午前/AM Off) / PTO(午後/PM Off) |
+| `sick` | — / `am` / `pm` | 病気休暇/Sick Leave (全休/Full Day) / (午前/AM) / (午後/PM) |
+
+`--half=am` means the morning is off; `pm` means the afternoon is off. The
+tool matches the 休暇名 by name, not by option ID, and fails with the list of
+available names if exactly one doesn't match.
+
+`rw` and `sick` require `--reason` (or `--reason-file=PATH`;
+`--reason-file=/dev/stdin` reads a heredoc, which avoids shell quoting).
+
+A run:
+
+1. Reads 休暇申請一覧 for the requested days and stops with exit code 2 if an
+   active (not 却下) request already covers one of them. `--allow-overlap`
+   files it anyway.
+2. Opens the form with the start date prefilled, selects the 休暇名, ticks
+   期間指定 / "Specify the time period" for a range and sets the end date, and
+   fills 休暇理由.
+3. Clicks "Go to Review Page" and checks that Jobcan echoes back the same
+   vacation name, dates and reason. The review page is printed, including
+   Jobcan's working-day count (Vacation Period).
+4. Prompts `y/N` (or skips the prompt with `--yes`; `--dry-run` stops here),
+   then clicks Request, which POSTs to `/employee/holiday/save`.
+5. Re-reads 休暇申請一覧 and reports the new 申請No. If no new request shows
+   up, it says the request was sent but not verified, so check Jobcan before
+   retrying.
+
+Jobcan caps a range at 40 working days and greys out "Go to Review Page"
+beyond that; the tool reports the on-page error.
+
 ## How duplicate submissions are avoided
 
 Between submitting stamps on 打刻修正 and your manager approving them, the
@@ -183,8 +238,11 @@ both are handled in `fetchLeaveApplications`:
 ├── tsconfig.json
 ├── .env                   # credentials (git-ignored)
 ├── .env.example
+├── .claude/skills/
+│   └── jobcan-vacation-request/SKILL.md  # Claude Code skill wrapping pnpm leave
 ├── src/
 │   ├── index.ts           # CLI: flags, orchestration, prompt, apply
+│   ├── request-leave.ts   # CLI: file a 休暇申請 (pnpm leave)
 │   ├── jobcan.ts          # login, scraping, planner, form submission
 │   ├── explore.ts         # read-only page dumper (whole flow)
 │   ├── probe-logs.ts      # dump 打刻一覧 for a single date
@@ -212,7 +270,7 @@ both are handled in `fetchLeaveApplications`:
   inspect the dumps in `./exploration/` to find the new markup
   (`04b-modify-modal.html` shows the 打刻 modal open), then update
   `fetchMonthRows` / `getExistingStamps` / `fetchLeaveApplications` /
-  `punchOnce`.
+  `punchOnce` / `createLeaveRequest`.
 
 ## Safety notes
 
